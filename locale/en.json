@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Auto handoff",
+    "detail": "docs/DETAIL.md",
+    "description": "Watches a conversation's context usage and, at a configurable threshold (default 75% of a 150000-token budget = 112500 — NOT 75% of the model's context window), writes a PROJECT_STATE.md handoff into the project directory and opens a new conversation in the same Workspace that continues the task. Default mode is auto: after install it silently monitors in the background and, at the threshold, automatically creates the new conversation and starts it running with a first prompt — no manual action needed. On handoff the old conversation receives a system-level notice to stop working on the task, and a .NOTICE.md file in the project directory records the new session id and document path. Switch between automatic / ask-first / off and tune budgetTokens / thresholdRatio from the Settings → Auto handoff panel, or with the /handoff command (status, auto, confirm, off, budget N, ratio R); changes are written to the user profile override layer and take effect after the plugin reloads. Turning the plugin off stops all checks; it does not delete any handoff document already written."
+  }
+}

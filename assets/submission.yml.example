@@ -1,0 +1,13 @@
+# 投稿条目模板 —— 提交到 awesome-dsh-plugin 仓库的 data/plugins/<owner>__<repo>.yml
+# 用法：把 OWNER/REPO 换成你的真实 GitHub 仓库（大小写按仓库实际来），
+#       文件名同步改为 data/plugins/OWNER__REPO.yml，然后把本文件内容拷过去。
+# 注意：只有 description.en 必填；zh 可留空由维护者补。描述只讲功能、不带营销词，
+#       且必须与代码一致（维护者会逐条核对）。
+
+url: https://github.com/OWNER/REPO
+name: OWNER/REPO
+category: session
+description:
+  en: 'Hands off a conversation when context usage reaches a configured threshold: writes a handoff document into the project and continues the task in a new session in the same workspace, with the new title carrying a -N suffix and an optional translucent four-color status tint on sidebar session rows.'
+  zh: '上下文用量达到设定阈值时自动交接：把交接文档写入项目目录，并在同一工作区的新会话中续接任务，新会话标题带 -N 后缀，并可为侧栏会话行叠加半透明四色状态染色（可开关）。'
+icon: https://raw.githubusercontent.com/OWNER/REPO/main/assets/icon-180.png

@@ -1,0 +1,36 @@
+{
+  "name": "@local/dsh-handoff-at-75",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "当对话的上下文用量达到自定义预算的 75% 时，自动在同一项目下新建对话、写好交接文档并让它继续任务。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md",
+    "docs",
+    "icon.svg",
+    "test/mock.test.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}
