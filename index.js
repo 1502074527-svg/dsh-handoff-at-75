@@ -60,6 +60,13 @@ const DEFAULTS = Object.freeze({
   stateFileName: 'PROJECT_STATE.md',
   rearmRatio: 0.4,
   rowTint: true,
+  // 交接后新会话使用的模型：空字符串 = 沿用 DSH 当前默认模型（不干预）。
+  handoffProvider: '',
+  handoffModel: '',
+  // 空字符串 = 不写显式推理强度，交给模型适配器默认值（与 selectModel 语义一致）。
+  handoffReasoningEffort: '',
+  // confirm 模式批准后 / 用户手动要求交接时，先弹一次卡片让用户临时选模型与强度。
+  askModelOnHandoff: true,
 })
 
 /** Cordis 的 Standard Schema：同步校验并把 config 归一化为带默认值的对象。 */
@@ -92,6 +99,23 @@ export const Config = {
       if (typeof rowTint !== 'boolean') {
         issues.push({ message: 'rowTint 必须是布尔值', path: ['rowTint'] })
       }
+      // 交接后新会话的模型选择：三个字符串字段，空串表示「沿用默认」。
+      const text = (key) => (raw[key] === undefined ? DEFAULTS[key] : String(raw[key]).trim())
+      const handoffProvider = text('handoffProvider')
+      const handoffModel = text('handoffModel')
+      const handoffReasoningEffort = text('handoffReasoningEffort')
+      if (handoffProvider.includes('/') || handoffModel.includes('/')) {
+        issues.push({ message: 'handoffProvider / handoffModel 必须是单纯的 id，不含 /', path: ['handoffModel'] })
+      }
+      // provider 与 model 必须成对出现：只填一个无法组成可用选择，宁可报错也不静默忽略。
+      if ((handoffProvider === '') !== (handoffModel === '')) {
+        issues.push({ message: 'handoffProvider 与 handoffModel 必须同时设置或同时留空', path: ['handoffModel'] })
+      }
+      const askModelOnHandoff = raw.askModelOnHandoff === undefined
+        ? DEFAULTS.askModelOnHandoff : raw.askModelOnHandoff
+      if (typeof askModelOnHandoff !== 'boolean') {
+        issues.push({ message: 'askModelOnHandoff 必须是布尔值', path: ['askModelOnHandoff'] })
+      }
       // 先统一算完所有数值，再判断是否有 issue；否则校验里推入的 issue 会丢在成功分支里。
       const resolved = {
         budgetTokens: Math.round(num('budgetTokens', 1000)),
@@ -101,6 +125,10 @@ export const Config = {
         stateFileName,
         rearmRatio: num('rearmRatio', 0, 0.9),
         rowTint,
+        handoffProvider,
+        handoffModel,
+        handoffReasoningEffort,
+        askModelOnHandoff,
       }
       if (issues.length) return { issues }
       return { value: resolved }
@@ -334,6 +362,243 @@ function answerApproved(answer, approveLabel) {
     (Array.isArray(item.selected) && item.selected.includes(approveLabel)) || item.custom === approveLabel)
 }
 
+/* ------------------------------------------------------------------ *
+ * 交接后新会话的「模型 + 推理强度」
+ *
+ * 数据来源是 Host 的 `sessionController.modelCatalog()`（provider 分组 +
+ * 每个模型可选的推理强度 + 部署默认值）。两条生效路径：
+ *   1. 面板/命令里设定一次，之后每次交接自动套用（config.handoff*）；
+ *   2. confirm 批准后、或用户手动要求交接时，弹卡现选一次（只影响这一次）。
+ * 套用走公开 API `sessionController.selectModel()`：它按会话记录选择、从下一个
+ * 步骤生效，并且会顺带把选择存成 DSH 的默认模型（用户已确认接受该副作用）。
+ * 任何一步失败都只降级为「用默认模型继续交接」，绝不让选模型把交接本身弄失败。
+ * ------------------------------------------------------------------ */
+
+/** 取「面板里设定的模型」；未设置返回 null（= 不干预，沿用 DSH 默认）。 */
+function configuredSelection(config) {
+  const provider = String(config?.handoffProvider ?? '').trim()
+  const model = String(config?.handoffModel ?? '').trim()
+  if (!provider || !model) return null
+  const effort = String(config?.handoffReasoningEffort ?? '').trim()
+  return effort ? { provider, model, reasoningEffort: effort } : { provider, model }
+}
+
+/** 人类可读的选择描述，用于日志、NOTICE 和命令回执。 */
+function describeSelection(selection) {
+  if (!selection) return '沿用 DSH 默认模型'
+  const base = `${selection.provider}/${selection.model}`
+  return selection.reasoningEffort ? `${base}（推理强度 ${selection.reasoningEffort}）` : base
+}
+
+/** 把选择装到指定会话上；返回 { applied, error? }，永不抛。 */
+async function applyHandoffSelection(ctx, sessionId, selection) {
+  if (!selection) return { applied: false }
+  const controller = ctx.sessionController
+  if (typeof controller?.selectModel !== 'function') {
+    log(ctx, '当前 DSH 未提供 sessionController.selectModel，新会话沿用默认模型')
+    return { applied: false, error: 'selectModel 不可用' }
+  }
+  try {
+    await controller.selectModel({ sessionId, ...selection })
+    return { applied: true }
+  } catch (error) {
+    // session/model-unavailable 等拒绝不应影响交接主流程，只如实记录。
+    log(ctx, `新会话模型设置失败（沿用默认模型继续交接）：${String(error?.message ?? error)}`)
+    return { applied: false, error: String(error?.message ?? error) }
+  }
+}
+
+/** 读模型目录；服务缺失或报错时返回 null（此时面板与命令只能手输）。 */
+async function readCatalog(ctx) {
+  const controller = ctx.sessionController
+  if (typeof controller?.modelCatalog !== 'function') return null
+  try {
+    const catalog = await controller.modelCatalog()
+    return catalog && Array.isArray(catalog.groups) ? catalog : null
+  } catch (error) {
+    log(ctx, `读取模型目录失败：${String(error?.message ?? error)}`)
+    return null
+  }
+}
+
+/** 目录里找某个 provider/model 条目（含推理强度列表）。 */
+function findCatalogModel(catalog, providerId, modelId) {
+  const group = (catalog?.groups ?? []).find((g) => g.id === providerId)
+  const model = (group?.models ?? []).find((m) => m.id === modelId)
+  return model ? { provider: group.id, providerName: group.name, model } : null
+}
+
+/**
+ * 解析 `/handoff model <provider>/<model>` 的输入。
+ * 接受 `provider/model`，也接受目录里唯一的裸 model id（省得让人背 provider）。
+ * 返回 { selection } | { clear: true } | { error }。
+ */
+function parseModelCommand(arg, catalog) {
+  const text = String(arg ?? '').trim()
+  if (text === 'default' || text === 'reset' || text === '') return { clear: true }
+  const slash = text.indexOf('/')
+  if (slash > 0 && slash < text.length - 1) {
+    const provider = text.slice(0, slash)
+    const model = text.slice(slash + 1)
+    const hit = catalog ? findCatalogModel(catalog, provider, model) : null
+    if (catalog && !hit) return { error: `模型 ${provider}/${model} 不在当前可用目录里` }
+    return { selection: { provider, model } }
+  }
+  // 裸 model id：只在目录里唯一命中时接受。
+  const hits = []
+  for (const group of catalog?.groups ?? []) {
+    for (const model of group.models ?? []) {
+      if (model.id === text || model.name === text) hits.push({ provider: group.id, model: model.id })
+    }
+  }
+  if (hits.length === 1) return { selection: { ...hits[0] } }
+  if (hits.length > 1) {
+    return { error: `模型 ${text} 在多个提供方下都有，请写成 provider/model：${hits.map((h) => `${h.provider}/${h.model}`).join('、')}` }
+  }
+  return { error: catalog ? `找不到模型 ${text}` : `需要写成 provider/model（当前读不到模型目录）` }
+}
+
+/** 解析 `/handoff effort <id>`；空/default 表示清除显式强度。 */
+function parseEffortCommand(arg) {
+  const text = String(arg ?? '').trim()
+  if (text === 'default' || text === 'reset' || text === '') return { clear: true }
+  return { effort: text }
+}
+
+const PICK_KEEP_DEFAULT = '沿用面板默认'
+const PICK_EFFORT_DEFAULT = '模型默认（不指定强度）'
+
+/** 从一次 userQuestions 回答里取选中的标签（单选；custom 覆盖 selected）。 */
+function answerLabel(answer) {
+  const item = answer?.answers?.[0]
+  if (!item) return ''
+  const custom = typeof item.custom === 'string' ? item.custom.trim() : ''
+  if (custom !== '') return custom
+  return Array.isArray(item.selected) && item.selected.length > 0 ? String(item.selected[0]) : ''
+}
+
+/**
+ * 交接时现选模型与推理强度（只影响这一次交接）。
+ *
+ * 分成两次提问：模型列表来自目录，推理强度依附于所选模型，所以必须先拿到模型。
+ * 任一题超时/跳过/出错都用「面板默认」继续，绝不打断交接。
+ * @returns {Promise<object|null>} 选择对象；null = 用面板默认。
+ */
+async function pickSelection(ctx, session, config) {
+  const agent = ctx.agents?.get?.(session.id)
+  if (agent === undefined) return null
+  const catalog = await readCatalog(ctx)
+  if (catalog === null) {
+    log(ctx, '读不到模型目录，跳过交接时的模型现选，沿用面板默认')
+    return null
+  }
+
+  // 展平目录，部署默认模型排在最前，最多列 8 个（卡片选项不宜过长）。
+  const entries = []
+  for (const group of catalog.groups) {
+    for (const model of group.models ?? []) {
+      entries.push({ provider: group.id, providerName: group.name, model })
+    }
+  }
+  const defaultProvider = catalog.default?.provider
+  const defaultModelId = catalog.default?.model
+  entries.sort((a, b) => {
+    const aDefault = a.provider === defaultProvider && a.model.id === defaultModelId ? 0 : 1
+    const bDefault = b.provider === defaultProvider && b.model.id === defaultModelId ? 0 : 1
+    return aDefault - bDefault
+  })
+  const visible = entries.slice(0, 8)
+  const byLabel = new Map()
+  const options = [{
+    label: PICK_KEEP_DEFAULT,
+    description: `用 Settings 里设定的模型：${describeSelection(configuredSelection(config))}`,
+  }]
+  for (const entry of visible) {
+    const label = `${entry.providerName} · ${entry.model.name}`
+    if (byLabel.has(label)) continue
+    byLabel.set(label, entry)
+    options.push({
+      label,
+      description: entry.model.description
+        ?? (entry.provider === defaultProvider && entry.model.id === defaultModelId ? '当前默认模型' : undefined),
+    })
+  }
+
+  let picked
+  try {
+    const answer = await ctx.userQuestions.askTimed({
+      agent,
+      questions: [{
+        id: 'handoff-model',
+        question: '交接后新建的这条对话用哪个模型？',
+        detail: '只影响这一次交接。也可以直接在自定义输入里写 provider/model。选「沿用面板默认」则用设置里保存的模型。',
+        header: '交接 · 模型',
+        options,
+      }],
+    }, randomUUID(), config.confirmTimeoutMs)
+    if ('pending' in answer) {
+      log(ctx, '交接时选模型超时，沿用面板默认')
+      return null
+    }
+    picked = answerLabel(answer)
+  } catch (error) {
+    log(ctx, `交接时选模型失败，沿用面板默认：${String(error?.message ?? error)}`)
+    return null
+  }
+  if (!picked || picked === PICK_KEEP_DEFAULT) return null
+
+  // 自定义输入：可能是 label，也可能是 provider/model。
+  let entry = byLabel.get(picked)
+  if (!entry) {
+    const parsed = parseModelCommand(picked, catalog)
+    if (parsed.error) {
+      log(ctx, `交接时输入的模型无法识别（${parsed.error}），沿用面板默认`)
+      return null
+    }
+    if (parsed.clear) return null
+    const hit = findCatalogModel(catalog, parsed.selection.provider, parsed.selection.model)
+    if (!hit) return null
+    entry = { provider: hit.provider, providerName: hit.providerName, model: hit.model }
+  }
+
+  const selection = { provider: entry.provider, model: entry.model.id }
+  const efforts = entry.model.reasoning?.efforts ?? []
+  if (efforts.length === 0) return selection
+
+  let effortLabel
+  try {
+    const answer = await ctx.userQuestions.askTimed({
+      agent,
+      questions: [{
+        id: 'handoff-effort',
+        question: `${entry.model.name} 用哪档推理强度？`,
+        detail: '只影响这一次交接。「模型默认」= 不写显式强度，交给模型适配器决定。',
+        header: '交接 · 推理强度',
+        options: [
+          { label: PICK_EFFORT_DEFAULT, description: '不指定，按模型默认强度运行' },
+          ...efforts.map((effort) => ({
+            label: effort.name,
+            description: effort.description
+              ?? (effort.id === entry.model.reasoning?.defaultEffort ? '该模型的默认强度' : undefined),
+          })),
+        ],
+      }],
+    }, randomUUID(), config.confirmTimeoutMs)
+    if ('pending' in answer) {
+      log(ctx, '交接时选推理强度超时，用模型默认强度')
+      return selection
+    }
+    effortLabel = answerLabel(answer)
+  } catch (error) {
+    log(ctx, `交接时选推理强度失败，用模型默认强度：${String(error?.message ?? error)}`)
+    return selection
+  }
+  if (!effortLabel || effortLabel === PICK_EFFORT_DEFAULT) return selection
+  const effort = efforts.find((item) => item.name === effortLabel || item.id === effortLabel)
+  if (effort) selection.reasoningEffort = effort.id
+  return selection
+}
+
 /**
  * 安全写交接文档：绝不覆盖用户已有的同名文件。
  * 优先用 'wx' 原子创建；若已存在，退到带时间戳的名字，返回实际文件名。
@@ -435,7 +700,10 @@ async function cancelOldSession(ctx, sessionId) {
 }
 
 /** 可从设置面板 / slash command 修改的字段白名单（其余字段只留在 patch 初始值里）。 */
-const EDITABLE = Object.freeze(['mode', 'budgetTokens', 'thresholdRatio', 'rowTint'])
+const EDITABLE = Object.freeze([
+  'mode', 'budgetTokens', 'thresholdRatio', 'rowTint',
+  'handoffProvider', 'handoffModel', 'handoffReasoningEffort', 'askModelOnHandoff',
+])
 
 /**
  * 解析一次配置修改请求。
@@ -497,6 +765,8 @@ function configSummary(config, patch) {
     `触发比例：${next.thresholdRatio}（触发点约 ${Math.round(next.budgetTokens * next.thresholdRatio)} tokens）`,
     `监测状态：${next.mode === 'off' ? '未监测' : '监测中'}`,
     `侧栏四色染色：${next.rowTint === false ? '关闭' : '开启'}`,
+    `交接新会话模型：${describeSelection(configuredSelection(next))}`,
+    `交接时现选模型：${next.askModelOnHandoff === false ? '关闭' : '开启（先询问 / 手动交接时弹卡）'}`,
   ]
   // 只有真正写入了补丁才提示「已写入 / 重载后生效」；status 是纯查询，不能这么陈述。
   if (patch && Object.keys(patch).length) {
@@ -505,7 +775,7 @@ function configSummary(config, patch) {
   return lines.join('\n')
 }
 
-/** /handoff 命令的输入解析：status / auto|confirm|off / budget N / ratio R。 */
+/** /handoff 命令的输入解析：status / auto|confirm|off / budget N / ratio R / model / effort / ask。 */
 export function parseCommandInput(raw) {
   const text = String(raw ?? '').trim()
   if (!text || text === 'status') return { kind: 'status' }
@@ -520,6 +790,15 @@ export function parseCommandInput(raw) {
   if (head === 'ratio' && parts.length === 2) {
     return { kind: 'patch', patch: { thresholdRatio: Number(parts[1]) } }
   }
+  if (head === 'model') {
+    return { kind: 'model', arg: parts.slice(1).join(' ').trim() }
+  }
+  if (head === 'effort') {
+    return { kind: 'effort', arg: parts.slice(1).join(' ').trim() }
+  }
+  if (head === 'ask' && parts.length === 2 && ['on', 'off'].includes(parts[1].toLowerCase())) {
+    return { kind: 'patch', patch: { askModelOnHandoff: parts[1].toLowerCase() === 'on' } }
+  }
   return { kind: 'help' }
 }
 
@@ -530,8 +809,64 @@ function commandHelp() {
     '  /handoff auto | confirm | off  切换「自动 / 提醒 / 停用」',
     '  /handoff budget 150000         设置 token 预算',
     '  /handoff ratio 0.75            设置触发比例（0.1~1）',
+    '  /handoff model                 查看/设置新会话模型（provider/model 或 default）',
+    '  /handoff effort <档位>         设置推理强度（default 清除，用模型默认）',
+    '  /handoff ask on | off          交接时是否弹卡现选模型',
     '设置也可在 Settings → 自动交接 面板里用图形控件完成。',
   ].join('\n')
+}
+
+/**
+ * 把 `/handoff model ...` / `/handoff effort ...` 解析成配置补丁。
+ * 两类命令都要对着实时模型目录校验（模型必须可用、强度必须是该模型支持的档位），
+ * 校验不过给明确错误，绝不写入一个到交接时才失败的值。
+ * @returns {Promise<{patch?:object, error?:string}>}
+ */
+async function resolveModelCommand(ctx, config, parsed) {
+  const catalog = await readCatalog(ctx)
+
+  if (parsed.kind === 'model') {
+    const result = parseModelCommand(parsed.arg, catalog)
+    if (result.error) return { error: result.error }
+    if (result.clear) {
+      return { patch: { handoffProvider: '', handoffModel: '', handoffReasoningEffort: '' } }
+    }
+    const { provider, model } = result.selection
+    // 换模型时旧强度可能不再适用：只在新模型确实支持同一档时才保留。
+    const hit = catalog ? findCatalogModel(catalog, provider, model) : null
+    const previous = String(config.handoffReasoningEffort ?? '')
+    const efforts = hit?.model?.reasoning?.efforts ?? []
+    const keep = previous === ''
+      ? undefined
+      : efforts.find((effort) => effort.id === previous || effort.name === previous)
+    return {
+      patch: {
+        handoffProvider: provider,
+        handoffModel: model,
+        handoffReasoningEffort: keep?.id ?? '',
+      },
+    }
+  }
+
+  const result = parseEffortCommand(parsed.arg)
+  if (result.clear) return { patch: { handoffReasoningEffort: '' } }
+
+  const provider = String(config.handoffProvider ?? '').trim()
+  const model = String(config.handoffModel ?? '').trim()
+  if (!provider || !model) {
+    return { error: '请先设置模型（/handoff model provider/model），推理强度依附于模型' }
+  }
+  const hit = catalog ? findCatalogModel(catalog, provider, model) : null
+  if (hit === null) {
+    return { error: catalog ? '当前设置的模型已不在可用目录里，请重新设置模型' : '读不到模型目录，暂时无法校验推理强度' }
+  }
+  const efforts = hit.model.reasoning?.efforts ?? []
+  if (efforts.length === 0) return { error: `${hit.model.name} 不支持设置推理强度` }
+  const match = efforts.find((effort) => effort.id === result.effort || effort.name === result.effort)
+  if (!match) {
+    return { error: `未知档位 ${result.effort}，可选：${efforts.map((effort) => effort.id).join(' / ')}` }
+  }
+  return { patch: { handoffReasoningEffort: match.id } }
 }
 
 /**
@@ -549,13 +884,22 @@ function registerConfigSurfaces(ctx, config) {
       name: 'handoff',
       description: '自动交接：查看/切换模式、设置预算与阈值',
       input: { hint: 'status | auto | confirm | off | budget N | ratio R' },
-      handler: (invocation) => {
+      handler: async (invocation) => {
         const parsed = parseCommandInput(invocation.rawInput)
         if (parsed.kind === 'help') return { kind: 'success', text: commandHelp() }
         if (parsed.kind === 'status') return { kind: 'success', text: configSummary(currentOf(ctx), {}) }
-        return setConfig(ctx, parsed.patch).then((result) => result.ok
+
+        // 模型与推理强度要对着实时目录校验，所以单独解析；其余字段直接走 setConfig。
+        let patch = parsed.patch
+        if (parsed.kind === 'model' || parsed.kind === 'effort') {
+          const resolved = await resolveModelCommand(ctx, currentOf(ctx), parsed)
+          if (resolved.error) return { kind: 'error', text: resolved.error }
+          patch = resolved.patch
+        }
+        const result = await setConfig(ctx, patch)
+        return result.ok
           ? { kind: 'success', text: configSummary(currentOf(ctx), result.config) }
-          : { kind: 'error', text: result.error })
+          : { kind: 'error', text: result.error }
       },
     }), 'handoff-at-75.command')
   })
@@ -593,6 +937,38 @@ function registerConfigSurfaces(ctx, config) {
       },
     }
     scoped.effect(() => fetchRegistry.register(route), 'handoff-at-75.route')
+
+    // 面板的「模型 / 推理强度」下拉需要实时目录（provider 分组、每模型可选强度、
+    // 以及部署默认值）。单独一条只读路由，避免把目录塞进每次配置读写。
+    scoped.effect(() => fetchRegistry.register({
+      path: '/api/auto-handoff/models',
+      methods: ['GET'],
+      fetch: async () => {
+        const catalog = await readCatalog(ctx)
+        if (catalog === null) {
+          return json({ ok: false, error: '当前 DSH 未提供模型目录（sessionController.modelCatalog），请用 /handoff model 命令设置' }, 501)
+        }
+        return json({
+          ok: true,
+          default: catalog.default ?? null,
+          groups: (catalog.groups ?? []).map((group) => ({
+            id: group.id,
+            name: group.name,
+            models: (group.models ?? []).map((model) => ({
+              id: model.id,
+              name: model.name,
+              ...model.description === undefined ? {} : { description: model.description },
+              ...model.reasoning === undefined ? {} : {
+                reasoning: {
+                  efforts: (model.reasoning.efforts ?? []).map((effort) => ({ id: effort.id, name: effort.name })),
+                  ...model.reasoning.defaultEffort === undefined ? {} : { defaultEffort: model.reasoning.defaultEffort },
+                },
+              },
+            })),
+          })),
+        })
+      },
+    }), 'handoff-at-75.models.route')
   })
 }
 
@@ -652,7 +1028,9 @@ function nextHandoffTitle(ctx, session, workspace, sessionTitle) {
  * @param {object} ctx - 插件上下文
  * @param {object} session - 旧会话
  * @param {object} config - 已解析配置
- * @param {{used:number, threshold:number, title?:string, reason:string, trigger?:'auto'|'manual'}} options
+ * @param {{used:number, threshold:number, title?:string, reason:string, trigger?:'auto'|'manual', selection?:object|null}} options
+ *   `selection` 是「这一次现选」的模型（{provider, model, reasoningEffort?}）；
+ *   缺省/为 null 时回落到 config 里存的面板默认值，仍未设置则沿用 DSH 默认模型。
  * @returns {Promise<boolean>} 是否完成交接（false 表示因缺 workspace/cwd/写盘失败而中止）
  */
 async function performHandoff(ctx, session, config, options) {
@@ -687,6 +1065,16 @@ async function performHandoff(ctx, session, config, options) {
 
   const { sessionId: newSessionId } = await ctx.sessionController.create({ workspaceId: workspace.id })
 
+  // 模型与推理强度：必须在首条提示词之前装好，否则新会话第一轮就会用默认模型跑。
+  // options.selection 是「这次现选」的结果；没现选就用面板里存的默认值。
+  const selection = options.selection ?? configuredSelection(config)
+  const applied = await applyHandoffSelection(ctx, newSessionId, selection)
+  const selectionLine = applied.applied
+    ? `- 新会话模型：${describeSelection(selection)}`
+    : applied.error !== undefined
+      ? `- 新会话模型：设置失败（${applied.error}），沿用默认模型`
+      : '- 新会话模型：沿用 DSH 默认模型'
+
   // 标题续接：延续旧标题 + `-N` 后缀。必须在 prompt 之前 rename——
   // rename 写入 source.kind='user' 会钉住标题，阻止首条提示词触发 LLM 自动命名
   // （否则标题会变成「请读取交接存档…」这类怪文本）。失败时降级，不阻断交接。
@@ -719,6 +1107,7 @@ async function performHandoff(ctx, session, config, options) {
       ? '[手动交接 · 已执行] 用户在本对话中要求「开个新对话继续此任务」，任务已在**同一项目**下新建对话继续。'
       : '[自动交接 · 已执行] 本对话上下文已达阈值，任务已在**同一项目**下新建对话继续。',
     `- 新会话 ID：${newSessionId}（请引导用户切到侧栏这条新对话继续）`,
+    selectionLine,
     `- 交接文档：${statePath}`,
     '- 请立即停止在本对话推进原任务，不要再调用工具或修改文件，避免两个会话并行、重复工作；',
     '  若用户还想补充信息，请提示他到新对话里说。本条提示由插件注入，不是用户的指令。',
@@ -734,6 +1123,7 @@ async function performHandoff(ctx, session, config, options) {
     `- 原会话 ID：${id}`,
     `- 新会话 ID：${newSessionId}（请切到侧栏这条新对话继续任务）`,
     ...(titleApplied ? [`- 新会话标题：**${newTitle}**（延续上一对话并加序号）`] : []),
+    selectionLine,
     `- 交接文档：${statePath}`,
     `- ${reasonLine}`,
     '- 请不要再在原会话继续推进该任务，避免两个会话并行、重复工作；如需补充信息，请直接在新对话里说。',
@@ -750,7 +1140,7 @@ async function performHandoff(ctx, session, config, options) {
           : '> 硬中止旧会话失败（见日志），旧会话仅收到文字提示，可能仍会跑完当前这一轮。',
   ].join('\n')
   const noticeName = await writeNotice(cwd, stateFileName, notice)
-  log(ctx, `${isManual ? '手动' : '自动'}交接完成：${id} → ${newSessionId}（文档 ${statePath}，通知 ${noticeName ?? '写入失败'}，旧会话提示 ${injected ? '已注入' : '降级'}，旧会话中止 ${stopped}${isManual ? '' : `，已用 ${used}/${config.budgetTokens}`}）`)
+  log(ctx, `${isManual ? '手动' : '自动'}交接完成：${id} → ${newSessionId}（文档 ${statePath}，通知 ${noticeName ?? '写入失败'}，旧会话提示 ${injected ? '已注入' : '降级'}，旧会话中止 ${stopped}，模型 ${describeSelection(selection)}${applied.applied ? '' : '（未生效）'}${isManual ? '' : `，已用 ${used}/${config.budgetTokens}`}）`)
   return true
 }
 
@@ -890,9 +1280,18 @@ export function apply(ctx, rawConfig) {
         }
       }
 
+      // 现选模型：只在「有人刚在场」的路径上发生——confirm 模式刚被用户批准，
+      // 或用户亲口要求交接（见 manualHandoff）。auto 模式必须保持无人值守，
+      // 不能为了选模型把自动交接卡在一次超时上，所以那里只用面板默认值。
+      let selection
+      if (mode === 'confirm' && config.askModelOnHandoff) {
+        selection = await pickSelection(ctx, session, config)
+      }
+
       const ok = await performHandoff(ctx, session, config, {
         used,
         threshold,
+        selection,
         reason: `上下文已用约 ${used} tokens（预算 ${config.budgetTokens}，阈值 ${Math.round(threshold)}）`,
       })
       if (ok) state.fired = true
@@ -964,9 +1363,12 @@ export function apply(ctx, rawConfig) {
       } catch { /* 用量读取失败不影响手动交接 */ }
 
       log(ctx, `手动交接：收到用户请求，开始执行（当前约 ${used} tokens）`)
+      // 用户就在场，顺手让他给这次交接挑个模型；超时/跳过都回落面板默认。
+      const selection = config.askModelOnHandoff ? await pickSelection(ctx, session, config) : undefined
       const ok = await performHandoff(ctx, session, config, {
         used,
         threshold,
+        selection,
         trigger: 'manual',
         reason: '用户在对话中明确要求「开个新对话继续此任务」',
       })

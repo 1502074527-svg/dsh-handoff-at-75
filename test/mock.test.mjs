@@ -11,7 +11,10 @@ await writeFile(path.join(cwd, 'existing.txt'), 'seed', 'utf8')
 
 const listeners = new Map()
 function makeCtx(overrides = {}) {
-  const calls = { created: [], prompts: [], logs: [], questions: [], contexts: [], effects: [], cancelled: [], renamed: [] }
+  const calls = {
+    created: [], prompts: [], logs: [], questions: [], contexts: [], effects: [],
+    cancelled: [], renamed: [], selected: [], order: [],
+  }
   const sessionId = overrides.sessionId ?? 'old-session'
   const workspace = { id: 'ws-1', title: '测试项目', path: cwd, sessionIds: [sessionId] }
   // 模拟 agent-scoped ctx：scoped.inject(['systemPrompt'], fn) 会把注册的内容记下来，
@@ -41,8 +44,38 @@ function makeCtx(overrides = {}) {
     workspaceRegistry: { list: () => [workspace] },
     workingDirectory: { get: () => cwd },
     sessionController: {
-      create: async (req) => { calls.created.push(req); return { sessionId: 'new-session' } },
-      prompt: async (req) => { calls.prompts.push(req); return { accepted: true } },
+      create: async (req) => { calls.created.push(req); calls.order.push('create'); return { sessionId: 'new-session' } },
+      prompt: async (req) => { calls.prompts.push(req); calls.order.push('prompt'); return { accepted: true } },
+      // 交接时套用「模型 + 推理强度」（公开 API）。overrides.selectThrows 可模拟被拒绝。
+      selectModel: async (req) => {
+        calls.selected.push(req)
+        calls.order.push('select')
+        if (overrides.selectThrows !== undefined) throw overrides.selectThrows
+        return { selected: req }
+      },
+      // Host 的实时模型目录；目录含两个强度的模型、一个无强度的模型和一个第二提供方。
+      modelCatalog: async () => {
+        if (overrides.catalogThrows !== undefined) throw overrides.catalogThrows
+        return overrides.catalog ?? {
+          default: { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'medium' },
+          groups: [
+            {
+              id: 'deepseek', name: 'DeepSeek', models: [
+                {
+                  id: 'deepseek-chat', name: 'DeepSeek Chat',
+                  reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'medium', name: '中' }], defaultEffort: 'medium' },
+                },
+                { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+              ],
+            },
+            {
+              id: 'other', name: 'Other', models: [
+                { id: 'gpt-x', name: 'GPT X', reasoning: { efforts: [{ id: 'high', name: '高' }] } },
+              ],
+            },
+          ],
+        }
+      },
       // 硬中止旧会话（等价用户按停止按钮）。默认成功；overrides.cancelThrows 可模拟失败。
       cancel: async (req) => {
         calls.cancelled.push(req)
@@ -51,6 +84,7 @@ function makeCtx(overrides = {}) {
       },
       rename: async (req) => {
         calls.renamed.push(req)
+        calls.order.push('rename')
         if (overrides.renameThrows !== undefined) throw overrides.renameThrows
         return { title: req.title, seq: 1 }
       },
@@ -72,6 +106,15 @@ function makeCtx(overrides = {}) {
     userQuestions: {
       askTimed: async (req) => {
         calls.questions.push(req)
+        const id = req.questions?.[0]?.id
+        // 交接时「现选模型」两问：默认走「沿用面板默认」，按 id 精确匹配，
+        // 避免把「确认交接」这类别处的默认答案误当模型选择。
+        if (id === 'handoff-model') {
+          return overrides.modelAnswer ?? { answers: [{ id, selected: ['沿用面板默认'] }] }
+        }
+        if (id === 'handoff-effort') {
+          return overrides.effortAnswer ?? { answers: [{ id, selected: ['模型默认（不指定强度）'] }] }
+        }
         return overrides.answer ?? { answers: [{ id: 'handoff', selected: ['确认交接'] }] }
       },
     },
@@ -383,7 +426,7 @@ function session(overrides = {}) {
   ctx.fiber = { entry: { id: 'handoff-at-75' } }
   ctx.inject = (deps, fn) => { if (deps.includes('connection')) fn({ get: (n) => n === 'connection' ? ctx.get('connection') : undefined, effect: (d) => d() }) }
   plugin.apply(ctx, { mode: 'auto', budgetTokens: 150000, thresholdRatio: 0.75 })
-  assert.equal(routes.length, 2, '配置路由 + 行状态路由')
+  assert.equal(routes.length, 3, '配置路由 + 模型目录路由 + 行状态路由')
   const route = routes.find((r) => r.path === '/api/auto-handoff/config')
   assert.ok(route, '应注册配置路由')
   // 与 dsh-client-connection/src/rpc.ts:153 的 ConnectionFetchRoute 契约对齐。
@@ -403,7 +446,10 @@ function session(overrides = {}) {
   assert.equal(got.status, 200)
   assert.equal(got.body.config.mode, 'auto')
   assert.equal(got.body.config.budgetTokens, 150000)
-  assert.deepEqual(got.body.editable, ['mode', 'budgetTokens', 'thresholdRatio', 'rowTint'])
+  assert.deepEqual(got.body.editable, [
+    'mode', 'budgetTokens', 'thresholdRatio', 'rowTint',
+    'handoffProvider', 'handoffModel', 'handoffReasoningEffort', 'askModelOnHandoff',
+  ])
   assert.equal(got.body.config.rowTint, true, 'GET 配置应带 rowTint 默认值')
 
   const posted = await read(await route.fetch(req('POST', JSON.stringify({ thresholdRatio: 0.5 }))))
@@ -765,6 +811,203 @@ function session(overrides = {}) {
   emitData('turn/end', s, { reason: { kind: 'error', error: { code: 'RATE_LIMIT' } } })
   assert.equal((await readStatuses())[SID], 'failed', '限流按普通失败，不冒充额度用尽')
   console.log('PASS 功能A：失败/额度保守采集（无信号不标、取消不标、新一轮清除）')
+}
+
+
+// --- 15. Config：模型/推理强度字段成对出现，缺省不干预 ---
+{
+  const s = plugin.Config['~standard']
+  const base = s.validate({}).value
+  assert.equal(base.handoffProvider, '', '模型缺省应为空（沿用 DSH 默认）')
+  assert.equal(base.handoffModel, '')
+  assert.equal(base.handoffReasoningEffort, '')
+  assert.equal(base.askModelOnHandoff, true, '交接时现选缺省开启')
+  assert.ok(s.validate({ handoffProvider: 'deepseek' }).issues, '只给 provider 不给 model 应报错')
+  assert.ok(s.validate({ handoffModel: 'deepseek-chat' }).issues, '只给 model 不给 provider 应报错')
+  assert.ok(s.validate({ handoffProvider: 'a/b', handoffModel: 'c' }).issues, 'id 里含 / 应报错')
+  assert.ok(s.validate({ askModelOnHandoff: 'yes' }).issues, 'askModelOnHandoff 非布尔应报错')
+  const ok = s.validate({ handoffProvider: 'deepseek', handoffModel: 'deepseek-chat', handoffReasoningEffort: 'high' })
+  assert.equal(ok.value.handoffProvider, 'deepseek')
+  assert.equal(ok.value.handoffReasoningEffort, 'high')
+  console.log('PASS Config：交接模型字段成对校验 + 缺省不干预')
+}
+
+// --- 16. /handoff model / effort / ask 命令解析 ---
+{
+  assert.deepEqual(plugin.parseCommandInput('model'), { kind: 'model', arg: '' })
+  assert.deepEqual(plugin.parseCommandInput('model deepseek/deepseek-chat'), { kind: 'model', arg: 'deepseek/deepseek-chat' })
+  assert.deepEqual(plugin.parseCommandInput('model default'), { kind: 'model', arg: 'default' })
+  assert.deepEqual(plugin.parseCommandInput('effort high'), { kind: 'effort', arg: 'high' })
+  assert.deepEqual(plugin.parseCommandInput('effort default'), { kind: 'effort', arg: 'default' })
+  assert.deepEqual(plugin.parseCommandInput('ask off'), { kind: 'patch', patch: { askModelOnHandoff: false } })
+  assert.deepEqual(plugin.parseCommandInput('ask on'), { kind: 'patch', patch: { askModelOnHandoff: true } })
+  assert.equal(plugin.parseCommandInput('ask maybe').kind, 'help')
+  console.log('PASS /handoff model / effort / ask 解析')
+}
+
+// --- 17. /handoff model 走实时目录校验，并联动清理不再适用的强度 ---
+{
+  listeners.clear()
+  const registered = []
+  const edits = []
+  const { ctx } = makeCtx()
+  ctx.get = (name) => name === 'configEditor' ? {
+    edit: async (_e, change) => { edits.push(change({})) },
+  } : undefined
+  ctx.fiber = { entry: { id: 'handoff-at-75' } }
+  ctx.inject = (deps, fn) => { if (deps.includes('commands')) fn({ effect: (d) => d(), commands: { register: (def) => { registered.push(def); return () => {} } } }) }
+  plugin.apply(ctx, { mode: 'auto', handoffProvider: 'deepseek', handoffModel: 'deepseek-chat', handoffReasoningEffort: 'low' })
+  const command = registered[0]
+
+  // 换到不支持 low 的模型：强度必须被清空，不能留一个交接时才炸的值。
+  const switched = await command.handler({ rawInput: 'model other/gpt-x' })
+  assert.equal(switched.kind, 'success')
+  const patch = edits.at(-1)
+  assert.equal(patch.handoffProvider, 'other')
+  assert.equal(patch.handoffModel, 'gpt-x')
+  assert.equal(patch.handoffReasoningEffort, '', '新模型不支持旧强度时应清空')
+
+  // 目录里没有的模型：明确报错且不写 profile。
+  const before = edits.length
+  const bogus = await command.handler({ rawInput: 'model deepseek/nope' })
+  assert.equal(bogus.kind, 'error')
+  assert.match(bogus.text, /不在当前可用目录/)
+  assert.equal(edits.length, before, '非法模型不应写 profile')
+
+  // 裸 model id 唯一命中时接受。
+  const bare = await command.handler({ rawInput: 'model deepseek-reasoner' })
+  assert.equal(bare.kind, 'success')
+  assert.equal(edits.at(-1).handoffModel, 'deepseek-reasoner')
+
+  // 强度必须是该模型支持的档位：切到有强度的模型后，未知档位报错、已知档位写入。
+  await command.handler({ rawInput: 'model deepseek/deepseek-chat' })
+  const badEffort = await command.handler({ rawInput: 'effort turbo' })
+  assert.equal(badEffort.kind, 'error')
+  assert.match(badEffort.text, /未知档位/)
+  const goodEffort = await command.handler({ rawInput: 'effort medium' })
+  assert.equal(goodEffort.kind, 'success')
+  assert.equal(edits.at(-1).handoffReasoningEffort, 'medium')
+  // 无强度的模型：给明确错误，而不是静默写入。
+  await command.handler({ rawInput: 'model deepseek/deepseek-reasoner' })
+  const noEffort = await command.handler({ rawInput: 'effort low' })
+  assert.equal(noEffort.kind, 'error')
+  assert.match(noEffort.text, /不支持设置推理强度/)
+
+  // 清除：model default 同时清掉强度。
+  const cleared = await command.handler({ rawInput: 'model default' })
+  assert.equal(cleared.kind, 'success')
+  assert.deepEqual(
+    { p: edits.at(-1).handoffProvider, m: edits.at(-1).handoffModel, e: edits.at(-1).handoffReasoningEffort },
+    { p: '', m: '', e: '' })
+  assert.match(cleared.text, /沿用 DSH 默认模型/)
+  console.log('PASS /handoff model：目录校验、联动清强度、default 重置')
+}
+
+// --- 18. auto 模式：面板设定的模型在首条提示词**之前**装到新会话上 ---
+{
+  listeners.clear()
+  const SID = 'case18'
+  const { ctx, calls } = makeCtx({ used: 120000, sessionId: SID })
+  plugin.apply(ctx, {
+    mode: 'auto',
+    stateFileName: 'MODEL.md',
+    handoffProvider: 'deepseek',
+    handoffModel: 'deepseek-reasoner',
+    handoffReasoningEffort: 'high',
+  })
+  emit('assistant/message', session({ id: SID }))
+  await new Promise(r => setTimeout(r, 60))
+  assert.equal(calls.selected.length, 1, '应把模型装到新会话上')
+  assert.deepEqual(calls.selected[0], {
+    sessionId: 'new-session', provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high',
+  })
+  assert.deepEqual(calls.order, ['create', 'select', 'rename', 'prompt'], '必须先装模型再发首条提示词')
+  const notice = await readFile(path.join(cwd, 'MODEL.NOTICE.md'), 'utf8')
+  assert.match(notice, /新会话模型：deepseek\/deepseek-reasoner（推理强度 high）/, 'NOTICE 应写明模型')
+  console.log('PASS auto 模式：面板默认模型在首条提示词前装好')
+}
+
+// --- 19. confirm 批准后现选：这一次的选择优先于面板默认值 ---
+{
+  listeners.clear()
+  const SID = 'case19'
+  const { ctx, calls } = makeCtx({
+    used: 120000,
+    sessionId: SID,
+    modelAnswer: { answers: [{ id: 'handoff-model', selected: ['Other · GPT X'] }] },
+    effortAnswer: { answers: [{ id: 'handoff-effort', selected: ['高'] }] },
+  })
+  plugin.apply(ctx, { mode: 'confirm', handoffProvider: 'deepseek', handoffModel: 'deepseek-chat', askModelOnHandoff: true })
+  emit('assistant/message', session({ id: SID }))
+  await new Promise(r => setTimeout(r, 80))
+  assert.equal(calls.created.length, 1, '批准后应新建')
+  assert.equal(calls.selected.length, 1)
+  assert.deepEqual(calls.selected[0], {
+    sessionId: 'new-session', provider: 'other', model: 'gpt-x', reasoningEffort: 'high',
+  }, '现选值应覆盖面板默认值')
+  const modelQuestion = calls.questions.find((q) => q.questions?.[0]?.id === 'handoff-model')
+  assert.ok(modelQuestion, '应先问模型')
+  assert.ok(modelQuestion.questions[0].options.some((o) => o.label === '沿用面板默认'), '必须提供「沿用面板默认」出口')
+  const effortQuestion = calls.questions.find((q) => q.questions?.[0]?.id === 'handoff-effort')
+  assert.ok(effortQuestion, '选定带强度的模型后应再问强度')
+  console.log('PASS confirm 现选：模型 + 推理强度覆盖面板默认')
+}
+
+// --- 20. 选模型失败绝不能把交接弄失败 ---
+{
+  listeners.clear()
+  const SID = 'case20'
+  const { ctx, calls } = makeCtx({
+    used: 120000,
+    sessionId: SID,
+    selectThrows: new Error('session/model-unavailable'),
+  })
+  plugin.apply(ctx, { mode: 'auto', stateFileName: 'FAILSEL.md', handoffProvider: 'deepseek', handoffModel: 'deepseek-chat' })
+  emit('assistant/message', session({ id: SID }))
+  await new Promise(r => setTimeout(r, 60))
+  assert.equal(calls.created.length, 1, '选模型失败仍要新建会话')
+  assert.equal(calls.prompts.length, 1, '选模型失败仍要发首条提示词')
+  const notice = await readFile(path.join(cwd, 'FAILSEL.NOTICE.md'), 'utf8')
+  assert.match(notice, /设置失败（session\/model-unavailable）/, 'NOTICE 应如实说明没装上')
+  console.log('PASS 选模型失败降级：交接照常完成并如实记录')
+}
+
+// --- 21. 读不到模型目录时，现选降级为面板默认，交接不受阻 ---
+{
+  listeners.clear()
+  const SID = 'case21'
+  const { ctx, calls } = makeCtx({ used: 120000, sessionId: SID, catalogThrows: new Error('no llm') })
+  plugin.apply(ctx, { mode: 'confirm', handoffProvider: 'deepseek', handoffModel: 'deepseek-chat', askModelOnHandoff: true })
+  emit('assistant/message', session({ id: SID }))
+  await new Promise(r => setTimeout(r, 80))
+  assert.equal(calls.created.length, 1, '读不到目录不应阻断交接')
+  assert.equal(calls.questions.filter((q) => q.questions?.[0]?.id === 'handoff-model').length, 0, '读不到目录就不该弹模型卡')
+  assert.deepEqual(calls.selected[0], { sessionId: 'new-session', provider: 'deepseek', model: 'deepseek-chat' }, '回落面板默认模型')
+  console.log('PASS 模型目录不可用：跳过现选、回落面板默认')
+}
+
+// --- 22. /api/auto-handoff/models：面板下拉的数据源 ---
+{
+  listeners.clear()
+  const routes = []
+  const { ctx } = makeCtx()
+  ctx.get = (name) => name === 'connection'
+    ? { fetch: { register: (route) => { routes.push(route); return () => {} } } }
+    : undefined
+  ctx.inject = (deps, fn) => { if (deps.includes('connection')) fn({ get: (n) => n === 'connection' ? ctx.get('connection') : undefined, effect: (d) => d() }) }
+  plugin.apply(ctx, { mode: 'auto' })
+  const route = routes.find((r) => r.path === '/api/auto-handoff/models')
+  assert.ok(route, '应注册模型目录路由')
+  assert.deepEqual(route.methods, ['GET'])
+  const body = await (await route.fetch(new Request('http://x'))).json()
+  assert.equal(body.ok, true)
+  assert.equal(body.default.provider, 'deepseek')
+  assert.deepEqual(body.groups.map((g) => g.id), ['deepseek', 'other'])
+  const chat = body.groups[0].models.find((m) => m.id === 'deepseek-chat')
+  assert.deepEqual(chat.reasoning.efforts.map((e) => e.id), ['low', 'medium'])
+  assert.equal(chat.reasoning.defaultEffort, 'medium')
+  assert.equal(body.groups[0].models.find((m) => m.id === 'deepseek-reasoner').reasoning, undefined, '无强度模型不带 reasoning')
+  console.log('PASS /api/auto-handoff/models：目录结构供面板下拉')
 }
 
 console.log('\nALL TESTS PASSED')

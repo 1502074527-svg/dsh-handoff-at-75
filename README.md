@@ -11,6 +11,7 @@
 2. 当用量 ≥ `budgetTokens × thresholdRatio`（默认 `150000 × 0.75 = 112500`）时：
    - 从已提交的会话日志确定性抽取「目标 / 有效决定 / 关键文件 / 真实进度 / 下一步 / 旧会话 ID」，写成项目目录下的交接文档；**绝不覆盖已有同名文件**——若已存在则自动改用带时间戳的文件名，新对话首条提示词会指向实际文件名；
    - 用 `ctx.sessionController.create({ workspaceId })` 在同一 Workspace 新建 Session（自动完成 agent 创建、侧栏公告、workspace 挂载）；
+   - 用 `ctx.sessionController.selectModel(...)` 把「交接后新会话的模型 / 推理强度」装到新会话上（必须在首条提示词之前，否则第一轮就用默认模型跑）；未设置时完全不干预，沿用 DSH 默认；
    - 用 `ctx.sessionController.prompt(...)` 给新会话发第一条用户消息，让它读交接存档后继续任务 —— `prompt` 内部 `followup()` 会唤醒 agent 直接开跑；
    - 用 `ctx.systemPrompt.context()` 在**旧会话**的 agent-scoped ctx 上注册一条持久系统级提示，让旧会话模型后续每一步都看到「任务已转到新会话、请立即停止推进」；
    - **硬中止旧会话**：用 `ctx.sessionController.cancel({ sessionId })` 结束旧会话正在执行的这一轮（等价于用户按停止按钮，`keepInbox` 保留排队输入）。只靠上面那条文字提示是不够的——实测旧会话收到提示后仍会继续跑 40+ 分钟（继续 `wait_agent`、改文件、写文档），所以必须真正中断 turn。空闲会话、无 live agent 或 cancel 失败时都降级为「仅提示」，不影响已完成的新会话；
@@ -40,6 +41,23 @@
 - 「交接存档 / 交接文档 / 交接逻辑 / 交接机制」等不触发——交接文档首条提示词本身就含这些词；
 - 同一会话只交接一次；子 Agent 会话不触发。
 
+## 交接后新会话用哪个模型（v1.1）
+
+交接出来的新对话默认继承 DSH 的默认模型。v1.1 起可以指定，两条路径都走同一个公开 API `ctx.sessionController.selectModel({ sessionId, provider, model, reasoningEffort? })`：
+
+| 路径 | 什么时候用 | 怎么设 |
+| --- | --- | --- |
+| **面板默认值**（持久） | 每次交接都想用同一个模型 | Settings → 自动交接 →「交接后的新对话」：模型 + 推理强度两个下拉。也可 `/handoff model deepseek/deepseek-chat`、`/handoff effort high`，`default` 清除 |
+| **交接时现选**（一次性） | 这次想临时换个更强/更省的模型 | `askModelOnHandoff=true`（默认）时，「先询问」模式批准后、或你手动说「开个新对话继续」之后，插件先弹两张卡：模型 → 推理强度。第一项永远是「沿用面板默认」，超时/跳过都回落面板值 |
+
+要点：
+
+- **顺序**：`create → selectModel → rename → prompt`。必须在首条提示词之前装好模型，否则新会话第一轮就已经用默认模型跑起来了。
+- **目录校验**：下拉与 `/handoff model` 都对着 `sessionController.modelCatalog()` 的实时目录校验；命令里写不在目录中的模型会直接报错，不会写进配置。
+- **换模型会清空强度**：旧档位对新模型未必有效（例如 Reasoner 与 Chat 的档位不同），切模型时强度自动清空，由你重选。
+- **副作用（已知并接受）**：DSH 的 `selectModel` 会同时把这次选择存成「默认模型」，即之后手动新建的对话也会用它。若不想再改默认值，把面板里模型设为「沿用 DSH 默认」并关掉「交接时弹卡现选」。
+- **失败只降级**：`selectModel` 被拒（`session/model-unavailable` 等）、模型目录读不到、弹卡超时，一律降级为「用默认模型继续交接」，并在日志与 `.NOTICE.md` 里如实写明；绝不让选模型把交接本身弄失败。
+
 ## 配置（`cordis.patch.yml` 的插件 config）
 
 | 字段 | 默认 | 说明 |
@@ -51,12 +69,16 @@
 | `stateFileName` | `PROJECT_STATE.md` | 交接文档文件名（写入项目 cwd）。若已存在，自动改用带时间戳的名字，绝不覆盖。 |
 | `rearmRatio` | `0.4` | 压缩后占用降到此比例以下可再次触发，并清掉 confirm 的「本代不再提醒」抑制。 |
 | `rowTint` | `true` | 侧栏会话行四色状态染色开关（进行中黄 / 待回答橙 / 完成未读绿 / 失败·额度用尽红，保留毛玻璃）。`false` 时彻底恢复宿主原生外观。面板里即时切换、即时生效，写入 profile 持久化；与 `mode` 正交——`mode=off` 不影响染色。 |
+| `handoffProvider` | `''` | 交接后新会话使用的模型提供方 id（如 `deepseek`）。与 `handoffModel` 必须成对出现；两个都留空 = 不干预，沿用 DSH 当前默认模型。 |
+| `handoffModel` | `''` | 模型 id（如 `deepseek-chat`）。交接时按实时模型目录校验，不在目录里则降级为默认模型并如实记录。 |
+| `handoffReasoningEffort` | `''` | 推理强度档位 id（如 `high` / `medium`）。留空 = 不写显式强度、用模型默认；该模型没有档位时会话不支持设置。 |
+| `askModelOnHandoff` | `true` | 交接时是否弹卡现选模型与强度。只在有人在场的路径生效：`confirm` 模式批准后、或用户手动要求交接时；`auto` 模式永远不弹（避免无人值守被一次超时卡住）。 |
 
 配置有四个入口，都落到同一份数据：
 
 1. **左侧栏「自动交接」图标**（`sidebar.panellist` + `main` 面板）：点击直接在中间列打开同一个设置面板；
 2. **Settings → 自动交接**（`settings.section`）：切换「全自动 / 先询问 / 停用」、开关「会话行状态染色」（四色，即时生效），修改 `budgetTokens` 与 `thresholdRatio`；
-3. **`/handoff` 命令**：`status` 查看、`auto|confirm|off` 切模式、`budget N`、`ratio R`；
+3. **`/handoff` 命令**：`status` 查看、`auto|confirm|off` 切模式、`budget N`、`ratio R`、`model <provider/model|default>`、`effort <档位|default>`、`ask on|off`；
 4. **配置文件**：本 bundle 自带的 `cordis.patch.yml`（初始值），以及**用户 profile 的 `cordis.patch.yml` 覆盖层**（`~/.dsh/profiles/desktop/cordis.patch.yml`，优先级更高、升级不丢）。
 
 界面与命令的改动经 `configEditor.edit()` 写入**用户 profile 覆盖层**，由 Loader 自动重载插件后生效（无需手改文件、无需重启 Host）。首次启用 Client 半需重载 bundle 并刷新页面以加载新 manifest。永久停用把 `mode` 设为 `off`，或在 Plugins 面板停用本插件；停用不会删除已生成的交接文档。
@@ -70,6 +92,7 @@
 - **明暗两套色值**（不是同一套调暗）：参考图的亮橙 `#F97316` 在白底只有 2.80:1，作小图形不合格，所以明色压深到 `#DC4B06`（3.62:1）、文字用 `#B4430B`（5.60:1）；暗色反而用亮橙 `#F97316`（5.64:1，更清楚）。
 - **主 CTA 自带成对前景/背景**（`--dh-cta-bg` / `--dh-cta-fg`）：不用宿主 `button-primary-fill`——它在暗色下翻成近白，与恒白的 `label-on-color` 撞成白字白底。
 - **触发模式用分段器而非下拉**：默认「全自动」是危险态（无人值守会新建会话并硬中止当前 turn），必须常显，不能藏进下拉。
+- **「交接后的新对话」是一张独立卡片**：模型 / 推理强度两个胶囊下拉 + 「交接时弹卡现选」开关，各自即时保存，不掺进「保存阈值」的批处理。模型目录来自 `GET /api/auto-handoff/models`；老版本 DSH 没有 `modelCatalog()` 时该路由返回 501，面板降级提示改用命令。
 - 刻度条语义严格是「预算标尺」（填充段止于 ratio），**不做假的实时用量环**——Client 侧拿不到实时 token 用量。
 
 样式以单个 `<style id="dh75-style">` 注入（幂等，三个入口共用），变量定义在 `.dh75-root` 作用域内，插件卸载后自动失效、不污染宿主。
@@ -114,3 +137,6 @@ node preview/a11y.mjs     # 真 Chrome 读 computed style：28 项 WCAG 对比�
 - 确认模式依赖当前有 live Agent 且有可用的回答者；否则跳过，不弹无人应答的卡片。选「暂不交接」只抑制到下一个事件，选「本代不再提醒」才持久抑制到下次压缩回落。
 - 交接成功后的反馈有三层：① **硬中止旧会话当前 turn**（`sessionController.cancel`，等价用户按停止按钮），这是唯一能真正阻止旧会话继续跑的手段；② 旧会话模型每步可见的系统级提示（`ctx.systemPrompt.context()`，见上，不新增会话事件、不唤醒 driver），作为「万一又被唤醒」时的第二道防线；③ 项目目录里的 `.NOTICE.md` 文件与侧栏新会话、logger 日志。系统级提示是**注册型**的，会一直存在到插件卸载；若服务缺失或旧会话已无 live Agent，则降级为只写 `.NOTICE.md` + 日志，不影响已完成的新会话。
 - auto 模式下新会话会自行开始运行并可能产生文件改动/token 消耗；这是「自动继续任务」的预期行为，若不希望如此请改用 `confirm`。
+- 选模型依赖 `sessionController.modelCatalog()` / `selectModel()`：DSH 版本较旧、未登录、或提供方凭据缺失时，目录可能为空或选择被拒——此时交接照常完成，只是新会话用默认模型，`.NOTICE.md` 会写明「设置失败（原因）」。
+- 交接时现选**只在有人在场的路径**弹卡：`confirm` 批准后、手动交接时。`auto` 模式刻意不弹——全自动的意义就是不用人盯着，弹一张 120 秒等不到答案的卡只会把交接拖慢。
+- `selectModel` 会顺带改 DSH 的默认模型（这是它的设计，不是本插件的额外动作）；详见上一节「副作用」。

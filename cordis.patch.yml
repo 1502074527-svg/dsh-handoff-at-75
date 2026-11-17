@@ -19,3 +19,11 @@
         # 侧栏会话行四色状态染色开关（进行中黄/待回答橙/完成未读绿/失败·额度用尽红，保留毛玻璃）
         # 面板里可即时开关；false = 彻底恢复宿主原生外观；与 mode 正交
         rowTint: true
+        # 交接后新会话使用的模型：provider 与 model 必须成对出现；
+        # 两个都留空 = 不干预，沿用 DSH 当前默认模型（想写就别留空，例如 deepseek / deepseek-chat）
+        handoffProvider: ''
+        handoffModel: ''
+        # 推理强度档位 id（如 high / medium）；留空 = 用模型默认强度
+        handoffReasoningEffort: ''
+        # 交接时是否弹卡现选模型：只在 confirm 批准后、或手动交接时生效；auto 模式不弹
+        askModelOnHandoff: true

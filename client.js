@@ -27,6 +27,7 @@ window.__ModuleLoader__.load({
     // 走已认证的 /api Fetch 通道（Host 侧用 ctx.connection.fetch.register 挂载），
     // 与命令共用 setConfig()，由 Host 做 peer 鉴权。
     const API = '/api/auto-handoff/config'
+    const MODELS_API = '/api/auto-handoff/models'
 
     /* ══════════════════════════════════════════════════════════════════
      * 样式表
@@ -201,6 +202,22 @@ html[data-ds-dark-theme] .dh75-legend>b:nth-child(1){background:#fde047}
 .dh75-input:disabled{background:var(--dh-disabled-bg);color:var(--dh-disabled-fg);cursor:not-allowed}
 .dh75-input::placeholder{color:var(--dh-ink-3)}
 
+/* 下拉：与数字输入同一套胶囊语言，但左对齐、可截断长模型名 */
+.dh75-select{max-width:240px;height:40px;padding:0 34px 0 14px;border-radius:999px;
+  border:1px solid transparent;background:var(--dh-field);
+  font-family:inherit;font-size:var(--dh-fs-body);font-weight:500;color:var(--dh-ink-1);
+  text-overflow:ellipsis;
+  appearance:none;-webkit-appearance:none;
+  background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);
+  background-position:calc(100% - 18px) 18px,calc(100% - 13px) 18px;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat;
+  transition:box-shadow .15s ease,background-color .15s ease}
+.dh75-select:hover:not(:disabled){box-shadow:inset 0 0 0 1px var(--dh-field-edge)}
+.dh75-select:disabled{background:var(--dh-disabled-bg);color:var(--dh-disabled-fg);cursor:not-allowed}
+.dh75-select option{color:#111;background:#fff}
+body[data-ds-dark-theme] .dh75-select option,
+html[data-ds-dark-theme] .dh75-select option{color:#eee;background:#222}
+
 .dh75-actions{display:flex;align-items:center;gap:10px;margin-top:20px;flex-wrap:wrap}
 .dh75-cta{height:40px;padding:0 22px;border:0;border-radius:999px;
   font-family:inherit;font-size:var(--dh-fs-body);font-weight:500;line-height:1;cursor:pointer;
@@ -251,6 +268,7 @@ html[data-ds-dark-theme] .dh75-legend>b:nth-child(1){background:#fde047}
   .dh75-actions .dh75-cta{flex:1 0 100%}
   .dh75-row{flex-wrap:wrap}
   .dh75-input{width:100%}
+  .dh75-select{max-width:100%;width:100%}
 }
 `
 
@@ -446,6 +464,38 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
       return { config, error, saving, message, reload, save }
     }
 
+    /**
+     * 模型目录：给「交接后的新对话」两个下拉填选项。
+     * 目录来自 Host 的 sessionController.modelCatalog()；老版本 DSH 没有该能力时
+     * 路由返回 501，这里把 catalog 置 null 并保留 error，面板降级为「读不到目录」提示，
+     * 用户仍可用 /handoff model 命令设置。目录只在挂载时读一次（模型配置变动后刷新面板即可）。
+     */
+    function useModels() {
+      const [catalog, setCatalog] = useState(undefined)
+      const [error, setError] = useState('')
+      useEffect(() => {
+        let alive = true
+        const load = async () => {
+          try {
+            const res = await fetch(MODELS_API, { cache: 'no-store', credentials: 'same-origin' })
+            const data = await res.json()
+            if (!alive) return
+            if (!data.ok) throw new Error(data.error || '读取失败')
+            setCatalog(data)
+            setError('')
+          } catch (e) {
+            if (!alive) return
+            setCatalog(null)
+            const raw = String(e.message ?? e)
+            setError(/^读取模型目录失败/.test(raw) ? raw : '读取模型目录失败：' + raw)
+          }
+        }
+        void load()
+        return () => { alive = false }
+      }, [])
+      return { catalog, error }
+    }
+
     const MODES = [
       { value: 'auto', label: '全自动', desc: '到阈值自动新建对话并直接开跑' },
       { value: 'confirm', label: '先询问', desc: '到阈值先弹卡，批准后才交接' },
@@ -481,6 +531,7 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
     function Panel({ variant, close }) {
       ensureStyle()
       const { config, error, saving, message, reload, save } = useConfig()
+      const { catalog, error: modelsError } = useModels()
       const [draft, setDraft] = useState(undefined)
       const dirty = useRef(false)
       const tintOn = useTint()
@@ -533,6 +584,43 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
       const modeDesc = MODES.find((m) => m.value === config.mode)?.desc ?? ''
       const compact = variant === 'compact'
 
+      // 交接后新会话的模型：'' = 不干预；否则手选 provider::model。
+      const modelValue = config.handoffProvider && config.handoffModel
+        ? `${config.handoffProvider}::${config.handoffModel}`
+        : ''
+      const modelOptions = (catalog && Array.isArray(catalog.groups) ? catalog.groups : []).flatMap((group) =>
+        (group.models ?? []).map((model) => ({
+          value: `${group.id}::${model.id}`,
+          label: `${group.name} · ${model.name}`,
+          efforts: model.reasoning?.efforts ?? [],
+        })))
+      const currentOption = modelOptions.find((option) => option.value === modelValue)
+      const efforts = currentOption && Array.isArray(currentOption.efforts) ? currentOption.efforts : []
+      // 目录已读（成功或失败）但仍匹配不上 → 把配置里的模型原样列出来，避免下拉显示空白。
+      const modelMissing = modelValue !== '' && catalog !== undefined && currentOption === undefined
+      const saveModel = (value) => {
+        // 换模型就清空强度：旧档位对新模型未必有效，Host 会拒绝不匹配的组合。
+        if (value === '') {
+          void save({ handoffProvider: '', handoffModel: '', handoffReasoningEffort: '' })
+          return
+        }
+        const at = value.indexOf('::')
+        void save({
+          handoffProvider: value.slice(0, at),
+          handoffModel: value.slice(at + 2),
+          handoffReasoningEffort: '',
+        })
+      }
+      const modelHint = modelsError !== ''
+        ? modelsError + '（可用 /handoff model 命令设置）'
+        : '新建对话使用的模型；「沿用 DSH 默认」= 不干预'
+      const effortHint = modelValue === ''
+        ? '先在左侧选模型；不选则跟随模型默认'
+        : efforts.length === 0
+          ? '该模型没有可调档位'
+          : '只对左侧这个模型生效'
+      const askOn = config.askModelOnHandoff !== false
+
       const commitNumbers = () => {
         const b = Number(draft.budget)
         const r = Number(draft.ratio)
@@ -578,6 +666,63 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
                 },
               }, m.label))),
             h('p', { className: 'dh75-seg-hint' }, modeDesc)),
+
+          // 交接后的新对话：模型与推理强度（默认值），以及是否在交接时弹卡现选。
+          // 三行各自即时保存（与 mode 分段器同款），不参与「保存阈值」的批处理。
+          h('div', { className: 'dh75-card' },
+            h('p', { className: 'dh75-sec-title' }, '交接后的新对话'),
+            h('div', { className: 'dh75-row' },
+              h('div', null,
+                h('p', { className: 'dh75-label' }, '模型'),
+                h('p', { className: 'dh75-sub', id: 'dh75-model-sub' }, modelHint)),
+              h('select', {
+                className: 'dh75-select',
+                value: modelValue,
+                disabled: saving || catalog === undefined,
+                'aria-label': '交接后新会话的模型',
+                'aria-describedby': 'dh75-model-sub',
+                onChange: (e) => saveModel(e.target.value),
+              }, [
+                h('option', { key: '', value: '' }, '沿用 DSH 默认'),
+                ...modelOptions.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
+                // 配置里的模型已不在当前目录（换了账号/下线了）：保留可见，避免静默变回默认。
+                ...(modelMissing
+                  ? [h('option', { key: 'missing', value: modelValue },
+                      `${config.handoffProvider} · ${config.handoffModel}（未在可用目录）`)]
+                  : []),
+              ])),
+            h('div', { className: 'dh75-row' },
+              h('div', null,
+                h('p', { className: 'dh75-label' }, '推理强度'),
+                h('p', { className: 'dh75-sub', id: 'dh75-effort-sub' }, effortHint)),
+              h('select', {
+                className: 'dh75-select',
+                value: config.handoffReasoningEffort || '',
+                disabled: saving || efforts.length === 0,
+                'aria-label': '交接后新会话的推理强度',
+                'aria-describedby': 'dh75-effort-sub',
+                onChange: (e) => void save({ handoffReasoningEffort: e.target.value }),
+              }, [
+                h('option', { key: '', value: '' }, '模型默认'),
+                ...efforts.map((effort) => h('option', { key: effort.id, value: effort.id }, effort.name)),
+              ])),
+            h('div', { className: 'dh75-row' },
+              h('div', null,
+                h('p', { className: 'dh75-label' }, '交接时弹卡现选'),
+                h('p', { className: 'dh75-sub', id: 'dh75-ask-sub' },
+                  '「先询问」批准后、或你手动要求交接时，先选模型与强度再建对话；全自动模式不弹，避免卡住')),
+              h('div', { className: 'dh75-switch-wrap' },
+                h('button', {
+                  type: 'button',
+                  className: 'dh75-switch',
+                  role: 'switch',
+                  'aria-checked': askOn,
+                  'aria-label': '交接时弹卡现选模型',
+                  'aria-describedby': 'dh75-ask-sub',
+                  disabled: saving,
+                  onClick: () => void save({ askModelOnHandoff: !askOn }),
+                }, h('i')),
+                h('span', { className: 'dh75-switch-state' }, askOn ? '开' : '关')))),
 
           // 侧栏显示：四色染色开关（与交接触发正交，即时生效、无需保存阈值）
           h('div', { className: 'dh75-card' },
@@ -663,7 +808,7 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
           // 脚注：命令胶囊，弱化到最低
           h('div', { className: 'dh75-foot' },
             h('div', { className: 'dh75-cmds' },
-              ['/handoff status', '/handoff confirm', '/handoff budget 150000', '/handoff ratio 0.75']
+              ['/handoff status', '/handoff confirm', '/handoff model deepseek/deepseek-chat', '/handoff effort high']
                 .map((c) => h('code', { key: c, className: 'dh75-cmd' }, c))),
             compact
               ? null
