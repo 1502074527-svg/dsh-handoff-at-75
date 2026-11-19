@@ -96,6 +96,13 @@ body[data-ds-dark-theme] .dh75-root, html[data-ds-dark-theme] .dh75-root{
 }
 
 .dh75-root *,.dh75-root *::before,.dh75-root *::after{box-sizing:border-box}
+/* 主面板的滚动层。DSH 的主面板容器（main 插槽）是 flex 子项，外层 .centre
+   带 overflow:hidden 且自己不滚动——插件的整页面板必须自带滚动区，
+   否则内容一超出窗口高度就被直接裁掉，窗口小的时候下半截永远够不到。
+   height:100% 对「父级是给了高度的一格」成立，flex:1/min-height:0 兜住
+   「父级是 flex column」的情形，两套一起写，哪种宿主布局都能滚。 */
+.dh75-page{width:100%;height:100%;min-height:0;flex:1 1 auto;
+  overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
 /* 主面板不再自带一层米色底：宿主已经有了面板背景，再加一层会变成「卡中卡」。
    改为纯留白容器，让白色卡片直接浮在宿主背景上（参考图正是这个关系）。 */
 .dh75-shell{padding:8px 4px 24px}
@@ -478,9 +485,17 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
         const load = async () => {
           try {
             const res = await fetch(MODELS_API, { cache: 'no-store', credentials: 'same-origin' })
-            const data = await res.json()
+            // 不能直接 res.json()：宿主异常/网关抖动时可能回空体或 HTML，
+            // 那样会抛 "Unexpected end of JSON input"，把面板变成一行红字。
+            // 先取文本再解析，解析失败按「目录不可用」降级，错误里带上 HTTP 状态。
+            const text = await res.text()
+            let data = null
+            try { data = text ? JSON.parse(text) : null } catch { data = null }
             if (!alive) return
-            if (!data.ok) throw new Error(data.error || '读取失败')
+            if (!data || !data.ok) {
+              const detail = (data && data.error) || `HTTP ${res.status}${text ? '' : '（空响应）'}`
+              throw new Error(detail)
+            }
             setCatalog(data)
             setError('')
           } catch (e) {
@@ -957,8 +972,10 @@ html [data-row-key^="session:"][data-dh75-tone="quota"] > span:first-child::afte
      * 2026-11-16 真机实测踩过，勿删。
      */
     function MainPanel() {
-      return h('div', { style: { width: '100%', maxWidth: 720, margin: '0 auto', padding: '8px 4px' } },
-        h(Panel, { variant: 'main' }))
+      // 外面那层 .dh75-page 是滚动容器：宿主不会替我们滚，必须自带（见 CSS 注释）。
+      return h('div', { className: 'dh75-page' },
+        h('div', { style: { width: '100%', maxWidth: 720, margin: '0 auto', padding: '8px 4px 24px' } },
+          h(Panel, { variant: 'main' })))
     }
 
     /** Settings 分区版：宽更窄，用紧凑变体。 */
